@@ -2,9 +2,10 @@
 Instagram new-posts monitor — powered by the Apify Instagram Post Scraper API
 (https://apify.com/apify/instagram-post-scraper), instead of scraping directly.
 
-Checks a list of Instagram accounts (stored in Supabase) for posts newer
-than the last seen post. Sends each new post as a photo + link to Telegram,
-and logs it into the ig_posts history table.
+Reports every post published on the FULL PREVIOUS CALENDAR DAY, Astana time
+(00:00–23:59, UTC+5) — regardless of exactly when the script happens to run.
+Sends each such post as a photo + link to Telegram, and logs it into the
+ig_posts history table (used to avoid re-sending a post already reported).
 
 Designed to run once per day as a scheduled GitHub Actions workflow.
 """
@@ -12,18 +13,38 @@ Designed to run once per day as a scheduled GitHub Actions workflow.
 import os
 import time
 import traceback
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone, time as dtime
 
 import requests
 
 from common import supabase, send_telegram_text, send_telegram_photo
 
-PAUSE_BETWEEN_ACCOUNTS = int(os.environ.get("PAUSE_BETWEEN_ACCOUNTS", "3"))
-RESULTS_PER_ACCOUNT = int(os.environ.get("RESULTS_PER_ACCOUNT", "5"))
+PAUSE_BETWEEN_ACCOUNTS = int(os.environ.get("PAUSE_BETWEEN_ACCOUNTS", "1"))
+RESULTS_PER_ACCOUNT = int(os.environ.get("RESULTS_PER_ACCOUNT", "1"))
 
 APIFY_TOKEN = os.environ["APIFY_TOKEN"]
 APIFY_ACTOR = "apify~instagram-post-scraper"
 APIFY_URL = f"https://api.apify.com/v2/acts/{APIFY_ACTOR}/run-sync-get-dataset-items"
+
+ASTANA_TZ = timezone(timedelta(hours=5))
+
+
+def get_yesterday_window():
+    """Full previous calendar day in Astana time, as (start, end) datetimes."""
+    now_local = datetime.now(ASTANA_TZ)
+    yesterday_date = (now_local - timedelta(days=1)).date()
+    start = datetime.combine(yesterday_date, dtime.min, tzinfo=ASTANA_TZ)
+    end = datetime.combine(yesterday_date, dtime.max, tzinfo=ASTANA_TZ)
+    return start, end
+
+
+def parse_post_date(raw: str):
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except Exception:
+        return None
 
 
 def get_accounts():
@@ -42,6 +63,11 @@ def mark_checked(username: str, error: str = None):
         {"last_error": error[:500] if error else None,
          "last_checked_at": datetime.now(timezone.utc).isoformat()}
     ).eq("username", username).execute()
+
+
+def get_existing_shortcodes(username: str) -> set:
+    res = supabase.table("ig_posts").select("shortcode").eq("username", username).execute()
+    return {row["shortcode"] for row in (res.data or [])}
 
 
 def log_post(username: str, post: dict):
@@ -68,7 +94,7 @@ def fetch_posts_from_apify(username: str):
         APIFY_URL,
         params={"token": APIFY_TOKEN},
         json={"username": [username], "resultsLimit": RESULTS_PER_ACCOUNT},
-        timeout=120,
+        timeout=60,
     )
     resp.raise_for_status()
     items = resp.json()
@@ -88,17 +114,12 @@ def fetch_posts_from_apify(username: str):
             }
         )
 
-    # Apify doesn't guarantee order — sort newest first using the date field
     posts.sort(key=lambda p: p["date"], reverse=True)
     return posts
 
 
-def check_account(account: dict):
+def check_account(account: dict, window_start, window_end):
     username = account["username"]
-    last_post_id = account.get("last_post_id")
-    first_run = last_post_id is None
-    new_posts = []
-
     try:
         posts = fetch_posts_from_apify(username)
 
@@ -106,16 +127,20 @@ def check_account(account: dict):
             mark_checked(username)
             return []
 
-        newest_id = posts[0]["shortcode"]
-        newest_date = posts[0]["date"]
+        # Keep last_post_id/date updated to the newest post overall — used
+        # by weekly_summary.py to flag accounts that have gone quiet.
+        update_last_post(username, posts[0]["shortcode"], posts[0]["date"])
 
-        if not first_run:
-            for post in posts:
-                if post["shortcode"] == last_post_id:
-                    break
+        existing = get_existing_shortcodes(username)
+        new_posts = []
+        for post in posts:
+            post_dt = parse_post_date(post["date"])
+            if not post_dt:
+                continue
+            post_dt_local = post_dt.astimezone(ASTANA_TZ)
+            if window_start <= post_dt_local <= window_end and post["shortcode"] not in existing:
                 new_posts.append(post)
 
-        update_last_post(username, newest_id, newest_date)
         mark_checked(username)
         return new_posts
 
@@ -132,12 +157,22 @@ def main():
         send_telegram_text("Список аккаунтов пуст — нечего проверять.")
         return
 
+    window_start, window_end = get_yesterday_window()
+    print(f"Checking posts published between {window_start} and {window_end} (Astana time)")
+
     total_new = 0
     failed = []
+    skipped_out_of_time = []
+    start_time = time.monotonic()
+    MAX_TOTAL_SECONDS = 20 * 60  # safety cap: never let the whole run exceed ~20 min
 
     for idx, account in enumerate(accounts):
+        if time.monotonic() - start_time > MAX_TOTAL_SECONDS:
+            skipped_out_of_time.extend(a["username"] for a in accounts[idx:])
+            break
+
         username = account["username"]
-        new_posts = check_account(account)
+        new_posts = check_account(account, window_start, window_end)
 
         for post in new_posts:
             log_post(username, post)
@@ -162,11 +197,17 @@ def main():
             time.sleep(PAUSE_BETWEEN_ACCOUNTS)
 
     if total_new == 0:
-        send_telegram_text("Новых постов за последние 24 часа нет.")
+        send_telegram_text(f"Постов за {window_start.date()} нет ни у одного аккаунта.")
 
     if failed:
         send_telegram_text(
             "\u26A0\uFE0F Не удалось проверить: " + ", ".join(f"@{u}" for u in failed)
+        )
+
+    if skipped_out_of_time:
+        send_telegram_text(
+            "\u23F1 Прогон превысил лимит времени, не успели проверить: "
+            + ", ".join(f"@{u}" for u in skipped_out_of_time)
         )
 
 
