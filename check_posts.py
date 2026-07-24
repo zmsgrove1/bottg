@@ -1,5 +1,7 @@
 """
-Instagram new-posts monitor.
+Instagram new-posts monitor — powered by the Apify Instagram Post Scraper API
+(https://apify.com/apify/instagram-post-scraper), instead of scraping directly.
+
 Checks a list of Instagram accounts (stored in Supabase) for posts newer
 than the last seen post. Sends each new post as a photo + link to Telegram,
 and logs it into the ig_posts history table.
@@ -12,50 +14,16 @@ import time
 import traceback
 from datetime import datetime, timezone
 
-import instaloader
+import requests
 
 from common import supabase, send_telegram_text, send_telegram_photo
 
-PAUSE_BETWEEN_ACCOUNTS = int(os.environ.get("PAUSE_BETWEEN_ACCOUNTS", "15"))
-MAX_POSTS_PER_ACCOUNT = 20
+PAUSE_BETWEEN_ACCOUNTS = int(os.environ.get("PAUSE_BETWEEN_ACCOUNTS", "3"))
+RESULTS_PER_ACCOUNT = int(os.environ.get("RESULTS_PER_ACCOUNT", "5"))
 
-
-class FailFastRateController(instaloader.RateController):
-    """Instaloader's default behavior on a 429 is to sleep until the rate
-    limit window resets — sometimes 30+ minutes — and then retry. That can
-    balloon a single account into a half-hour hang. Instead, refuse to wait
-    more than a few seconds; raise so the caller can skip this account and
-    move on, rather than silently sleeping the whole job."""
-
-    MAX_SLEEP_SECONDS = 10
-
-    def sleep(self, secs: float):
-        if secs > self.MAX_SLEEP_SECONDS:
-            raise instaloader.exceptions.ConnectionException(
-                f"Rate-limited; would need to wait {secs:.0f}s — skipping instead of waiting"
-            )
-        time.sleep(secs)
-
-
-L = instaloader.Instaloader(
-    download_pictures=False,
-    download_videos=False,
-    download_video_thumbnails=False,
-    save_metadata=False,
-    compress_json=False,
-    quiet=True,
-    request_timeout=15,          # default is 300s — too long if IG hangs a request
-    max_connection_attempts=1,   # don't internally retry a stuck/rate-limited account
-    rate_controller=lambda ctx: FailFastRateController(ctx),
-)
-
-IG_SESSION_USERNAME = os.environ.get("IG_SESSION_USERNAME")
-IG_SESSION_FILE = os.environ.get("IG_SESSION_FILE")
-if IG_SESSION_USERNAME and IG_SESSION_FILE:
-    try:
-        L.load_session_from_file(IG_SESSION_USERNAME, filename=IG_SESSION_FILE)
-    except Exception as e:
-        print(f"Could not load IG session, continuing anonymously: {e}")
+APIFY_TOKEN = os.environ["APIFY_TOKEN"]
+APIFY_ACTOR = "apify~instagram-post-scraper"
+APIFY_URL = f"https://api.apify.com/v2/acts/{APIFY_ACTOR}/run-sync-get-dataset-items"
 
 
 def get_accounts():
@@ -93,6 +61,38 @@ def log_post(username: str, post: dict):
         print(f"Could not log post history for {username}/{post['shortcode']}: {e}")
 
 
+def fetch_posts_from_apify(username: str):
+    """Calls Apify's Instagram Post Scraper synchronously and returns a list
+    of posts (newest first), normalized to our own dict shape."""
+    resp = requests.post(
+        APIFY_URL,
+        params={"token": APIFY_TOKEN},
+        json={"username": [username], "resultsLimit": RESULTS_PER_ACCOUNT},
+        timeout=120,
+    )
+    resp.raise_for_status()
+    items = resp.json()
+
+    posts = []
+    for item in items:
+        shortcode = item.get("shortCode") or item.get("shortcode")
+        if not shortcode:
+            continue
+        posts.append(
+            {
+                "shortcode": shortcode,
+                "url": item.get("url") or f"https://www.instagram.com/p/{shortcode}/",
+                "image_url": item.get("displayUrl") or item.get("thumbnailSrc") or "",
+                "date": item.get("timestamp") or "",
+                "caption": (item.get("caption") or "").strip()[:300],
+            }
+        )
+
+    # Apify doesn't guarantee order — sort newest first using the date field
+    posts.sort(key=lambda p: p["date"], reverse=True)
+    return posts
+
+
 def check_account(account: dict):
     username = account["username"]
     last_post_id = account.get("last_post_id")
@@ -100,39 +100,22 @@ def check_account(account: dict):
     new_posts = []
 
     try:
-        profile = instaloader.Profile.from_username(L.context, username)
-        posts = profile.get_posts()
+        posts = fetch_posts_from_apify(username)
 
-        newest_id = None
-        newest_date = None
+        if not posts:
+            mark_checked(username)
+            return []
 
-        for i, post in enumerate(posts):
-            if i == 0:
-                newest_id = str(post.mediaid)
-                newest_date = post.date_utc.isoformat()
+        newest_id = posts[0]["shortcode"]
+        newest_date = posts[0]["date"]
 
-            if first_run:
-                break
+        if not first_run:
+            for post in posts:
+                if post["shortcode"] == last_post_id:
+                    break
+                new_posts.append(post)
 
-            if str(post.mediaid) == last_post_id:
-                break
-
-            new_posts.append(
-                {
-                    "shortcode": post.shortcode,
-                    "url": f"https://www.instagram.com/p/{post.shortcode}/",
-                    "image_url": post.url,
-                    "date": post.date_utc.isoformat(),
-                    "caption": (post.caption or "").strip()[:300],
-                }
-            )
-
-            if i >= MAX_POSTS_PER_ACCOUNT - 1:
-                break
-
-        if newest_id:
-            update_last_post(username, newest_id, newest_date)
-
+        update_last_post(username, newest_id, newest_date)
         mark_checked(username)
         return new_posts
 
@@ -151,15 +134,8 @@ def main():
 
     total_new = 0
     failed = []
-    skipped_out_of_time = []
-    start_time = time.monotonic()
-    MAX_TOTAL_SECONDS = 20 * 60  # safety cap: never let the whole run exceed ~20 min
 
     for idx, account in enumerate(accounts):
-        if time.monotonic() - start_time > MAX_TOTAL_SECONDS:
-            skipped_out_of_time.extend(a["username"] for a in accounts[idx:])
-            break
-
         username = account["username"]
         new_posts = check_account(account)
 
@@ -167,8 +143,11 @@ def main():
             log_post(username, post)
             caption_snippet = f"\n{post['caption'][:150]}" if post["caption"] else ""
             text = f"\U0001F4F8 @{username}\n{post['url']}{caption_snippet}"
-            resp = send_telegram_photo(post["image_url"], text)
-            if resp.status_code != 200:
+            if post["image_url"]:
+                resp = send_telegram_photo(post["image_url"], text)
+                if resp.status_code != 200:
+                    send_telegram_text(text)
+            else:
                 send_telegram_text(text)
             total_new += 1
             time.sleep(1)
@@ -188,12 +167,6 @@ def main():
     if failed:
         send_telegram_text(
             "\u26A0\uFE0F Не удалось проверить: " + ", ".join(f"@{u}" for u in failed)
-        )
-
-    if skipped_out_of_time:
-        send_telegram_text(
-            "\u23F1 Прогон превысил лимит времени, не успели проверить: "
-            + ", ".join(f"@{u}" for u in skipped_out_of_time)
         )
 
 

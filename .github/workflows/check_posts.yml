@@ -21,16 +21,13 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Restore Instagram session
-        run: echo "${{ secrets.IG_SESSION_B64 }}" | base64 -d > ig_session
-
       - name: Run monitor
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          PAUSE_BETWEEN_ACCOUNTS: "15"
-          IG_SESSION_USERNAME: ${{ secrets.IG_SESSION_USERNAME }}
-          IG_SESSION_FILE: ig_session
+          APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
+          PAUSE_BETWEEN_ACCOUNTS: "3"
+          RESULTS_PER_ACCOUNT: "5"
         run: python check_posts.py
