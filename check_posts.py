@@ -17,7 +17,7 @@ from datetime import datetime, timedelta, timezone, time as dtime
 
 import requests
 
-from common import supabase, send_telegram_text, send_telegram_photo
+from common import supabase, send_telegram_text, send_telegram_photo, translate_text
 
 PAUSE_BETWEEN_ACCOUNTS = int(os.environ.get("PAUSE_BETWEEN_ACCOUNTS", "1"))
 RESULTS_PER_ACCOUNT = int(os.environ.get("RESULTS_PER_ACCOUNT", "1"))
@@ -176,7 +176,14 @@ def main():
 
         for post in new_posts:
             log_post(username, post)
-            caption_snippet = f"\n{post['caption'][:150]}" if post["caption"] else ""
+            caption_snippet = ""
+            if post["caption"]:
+                original = post["caption"][:150]
+                translated = translate_text(original)
+                if translated:
+                    caption_snippet = f"\n{translated}"
+                else:
+                    caption_snippet = f"\n{original}"
             text = f"\U0001F4F8 @{username}\n{post['url']}{caption_snippet}"
             if post["image_url"]:
                 resp = send_telegram_photo(post["image_url"], text)

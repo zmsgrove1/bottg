@@ -44,3 +44,38 @@ def send_telegram_photo(photo_url: str, caption: str, chat_id: str = None):
     if resp.status_code != 200:
         print(f"Telegram sendPhoto failed: {resp.status_code} {resp.text}")
     return resp
+
+
+MYMEMORY_EMAIL = os.environ.get("MYMEMORY_EMAIL")
+
+
+def translate_text(text: str, source: str = "tr", target: str = "ru") -> str:
+    """Free translation via MyMemory (no API key needed). Without an email,
+    the anonymous quota is ~5000 words/day; passing an email raises it to
+    ~10000 words/day — still free, no signup required.
+    Returns an empty string if translation fails — caller should fall back
+    to showing the original text rather than breaking the whole message."""
+    if not text or not text.strip():
+        return ""
+    try:
+        params = {"q": text[:490], "langpair": f"{source}|{target}"}
+        if MYMEMORY_EMAIL:
+            params["de"] = MYMEMORY_EMAIL
+        resp = requests.get(
+            "https://api.mymemory.translated.net/get",
+            params=params,
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            print(f"Translation failed: {resp.status_code} {resp.text}")
+            return ""
+        data = resp.json()
+        translated = data.get("responseData", {}).get("translatedText", "")
+        # MyMemory sometimes returns an error string as "translated" text
+        if "MYMEMORY WARNING" in translated.upper():
+            print(f"Translation quota/warning: {translated}")
+            return ""
+        return translated
+    except Exception as e:
+        print(f"Translation error: {e}")
+        return ""

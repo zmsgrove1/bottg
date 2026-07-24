@@ -30,4 +30,5 @@ jobs:
           APIFY_TOKEN: ${{ secrets.APIFY_TOKEN }}
           PAUSE_BETWEEN_ACCOUNTS: "1"
           RESULTS_PER_ACCOUNT: "1"
+          MYMEMORY_EMAIL: ${{ secrets.MYMEMORY_EMAIL }}
         run: python check_posts.py
