@@ -1,0 +1,18 @@
+services:
+  - type: cron
+    name: ig-post-monitor
+    env: python
+    schedule: "0 6 * * *"   # каждый день в 06:00 UTC = 11:00 по Астане (UTC+5)
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python check_posts.py"
+    envVars:
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_KEY
+        sync: false
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: PAUSE_BETWEEN_ACCOUNTS
+        value: "15"
