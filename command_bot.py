@@ -1,12 +1,12 @@
 """
 Polls Telegram for new messages sent to the bot and processes account
-management commands:
+management via buttons (a persistent reply keyboard) instead of typed
+slash commands. Actions that need a username (add/remove/pause/resume)
+ask for it as a follow-up message; the bot remembers what it's waiting
+for per chat using the bot_state table.
 
-  /add username        — start monitoring this account
-  /remove username      — stop monitoring and delete its saved state
-  /pause username       — temporarily stop checking (keeps saved state)
-  /resume username      — resume checking a paused account
-  /list                 — list all accounts and their status
+Slash commands (/add username, /remove username, etc.) still work too,
+for convenience.
 
 Designed to run every few minutes as a scheduled GitHub Actions workflow
 (there is no always-on server, so replies land within that polling window,
@@ -20,6 +20,22 @@ from common import supabase, TELEGRAM_BOT_TOKEN, send_telegram_text
 
 USERNAME_RE = re.compile(r"^[A-Za-z0-9._]{1,60}$")
 
+MAIN_KEYBOARD = {
+    "keyboard": [
+        ["📋 Список"],
+        ["➕ Добавить", "➖ Удалить"],
+        ["⏸ Пауза", "▶️ Включить"],
+    ],
+    "resize_keyboard": True,
+}
+
+BUTTON_TO_ACTION = {
+    "➕ Добавить": ("add", "Напишите юзернейм аккаунта для добавления (без @):"),
+    "➖ Удалить": ("remove", "Напишите юзернейм аккаунта для удаления:"),
+    "⏸ Пауза": ("pause", "Напишите юзернейм аккаунта для паузы:"),
+    "▶️ Включить": ("resume", "Напишите юзернейм аккаунта для включения:"),
+}
+
 
 def get_offset() -> int:
     res = supabase.table("bot_state").select("value").eq("key", "last_update_id").single().execute()
@@ -30,6 +46,21 @@ def set_offset(update_id: int):
     supabase.table("bot_state").update({"value": str(update_id)}).eq(
         "key", "last_update_id"
     ).execute()
+
+
+def get_pending(chat_id: str):
+    res = supabase.table("bot_state").select("value").eq("key", f"pending:{chat_id}").execute()
+    return res.data[0]["value"] if res.data else None
+
+
+def set_pending(chat_id: str, action: str):
+    supabase.table("bot_state").upsert(
+        {"key": f"pending:{chat_id}", "value": action}
+    ).execute()
+
+
+def clear_pending(chat_id: str):
+    supabase.table("bot_state").delete().eq("key", f"pending:{chat_id}").execute()
 
 
 def get_updates(offset: int):
@@ -45,60 +76,89 @@ def clean_username(raw: str) -> str:
 
 def handle_add(username: str, chat_id: str):
     if not USERNAME_RE.match(username):
-        send_telegram_text(f"Некорректный юзернейм: {username}", chat_id=chat_id)
+        send_telegram_text(f"Некорректный юзернейм: {username}", chat_id=chat_id, reply_markup=MAIN_KEYBOARD)
         return
     existing = supabase.table("ig_accounts").select("username").eq("username", username).execute()
     if existing.data:
         supabase.table("ig_accounts").update({"active": True}).eq("username", username).execute()
-        send_telegram_text(f"@{username} уже был в списке — включил обратно.", chat_id=chat_id)
+        send_telegram_text(f"@{username} уже был в списке — включил обратно.", chat_id=chat_id, reply_markup=MAIN_KEYBOARD)
     else:
         supabase.table("ig_accounts").insert({"username": username, "active": True}).execute()
-        send_telegram_text(f"✅ Добавил @{username} в список отслеживания.", chat_id=chat_id)
+        send_telegram_text(f"✅ Добавил @{username} в список отслеживания.", chat_id=chat_id, reply_markup=MAIN_KEYBOARD)
 
 
 def handle_remove(username: str, chat_id: str):
     res = supabase.table("ig_accounts").delete().eq("username", username).execute()
     if res.data:
-        send_telegram_text(f"🗑 Удалил @{username} из списка.", chat_id=chat_id)
+        send_telegram_text(f"🗑 Удалил @{username} из списка.", chat_id=chat_id, reply_markup=MAIN_KEYBOARD)
     else:
-        send_telegram_text(f"@{username} не найден в списке.", chat_id=chat_id)
+        send_telegram_text(f"@{username} не найден в списке.", chat_id=chat_id, reply_markup=MAIN_KEYBOARD)
 
 
 def handle_pause(username: str, chat_id: str):
     res = supabase.table("ig_accounts").update({"active": False}).eq("username", username).execute()
     if res.data:
-        send_telegram_text(f"⏸ @{username} поставлен на паузу.", chat_id=chat_id)
+        send_telegram_text(f"⏸ @{username} поставлен на паузу.", chat_id=chat_id, reply_markup=MAIN_KEYBOARD)
     else:
-        send_telegram_text(f"@{username} не найден в списке.", chat_id=chat_id)
+        send_telegram_text(f"@{username} не найден в списке.", chat_id=chat_id, reply_markup=MAIN_KEYBOARD)
 
 
 def handle_resume(username: str, chat_id: str):
     res = supabase.table("ig_accounts").update({"active": True}).eq("username", username).execute()
     if res.data:
-        send_telegram_text(f"▶️ @{username} снова активен.", chat_id=chat_id)
+        send_telegram_text(f"▶️ @{username} снова активен.", chat_id=chat_id, reply_markup=MAIN_KEYBOARD)
     else:
-        send_telegram_text(f"@{username} не найден в списке.", chat_id=chat_id)
+        send_telegram_text(f"@{username} не найден в списке.", chat_id=chat_id, reply_markup=MAIN_KEYBOARD)
 
 
 def handle_list(chat_id: str):
     res = supabase.table("ig_accounts").select("username, active, last_error").execute()
     accounts = res.data or []
     if not accounts:
-        send_telegram_text("Список пуст.", chat_id=chat_id)
+        send_telegram_text("Список пуст.", chat_id=chat_id, reply_markup=MAIN_KEYBOARD)
         return
     lines = ["📋 Список аккаунтов:\n"]
     for a in sorted(accounts, key=lambda x: x["username"]):
         status = "🟢" if a["active"] else "⏸"
         err = " ⚠️" if a.get("last_error") else ""
         lines.append(f"{status} @{a['username']}{err}")
-    send_telegram_text("\n".join(lines), chat_id=chat_id)
+    send_telegram_text("\n".join(lines), chat_id=chat_id, reply_markup=MAIN_KEYBOARD)
 
 
 def process_message(text: str, chat_id: str):
-    parts = text.strip().split(maxsplit=1)
-    if not parts:
+    text = text.strip()
+    if not text:
         return
-    command = parts[0].lower().split("@")[0]  # strip @botname if present
+
+    # 1) If we're waiting for a username after a button press, this
+    #    message IS that username — act on it and clear the pending state.
+    pending = get_pending(chat_id)
+    if pending:
+        username = clean_username(text)
+        clear_pending(chat_id)
+        {
+            "add": handle_add,
+            "remove": handle_remove,
+            "pause": handle_pause,
+            "resume": handle_resume,
+        }[pending](username, chat_id)
+        return
+
+    # 2) Button presses that need a follow-up username.
+    if text in BUTTON_TO_ACTION:
+        action, prompt = BUTTON_TO_ACTION[text]
+        set_pending(chat_id, action)
+        send_telegram_text(prompt, chat_id=chat_id, reply_markup=MAIN_KEYBOARD)
+        return
+
+    # 3) Button press that needs no argument.
+    if text == "📋 Список":
+        handle_list(chat_id)
+        return
+
+    # 4) Fall back to classic slash commands, for convenience.
+    parts = text.split(maxsplit=1)
+    command = parts[0].lower().split("@")[0]
     arg = clean_username(parts[1]) if len(parts) > 1 else ""
 
     if command == "/add" and arg:
@@ -113,13 +173,10 @@ def process_message(text: str, chat_id: str):
         handle_list(chat_id)
     elif command in ("/start", "/help"):
         send_telegram_text(
-            "Команды:\n"
-            "/add username — добавить аккаунт\n"
-            "/remove username — удалить аккаунт\n"
-            "/pause username — поставить на паузу\n"
-            "/resume username — снять с паузы\n"
-            "/list — показать все аккаунты",
+            "Выберите действие кнопкой ниже, или используйте команды:\n"
+            "/add username, /remove username, /pause username, /resume username, /list",
             chat_id=chat_id,
+            reply_markup=MAIN_KEYBOARD,
         )
 
 

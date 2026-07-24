@@ -12,18 +12,18 @@ TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
-def send_telegram_text(text: str, chat_id: str = None):
+def send_telegram_text(text: str, chat_id: str = None, reply_markup: dict = None):
+    import json as _json
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    resp = requests.post(
-        url,
-        data={
-            "chat_id": chat_id or TELEGRAM_CHAT_ID,
-            "text": text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-        },
-        timeout=30,
-    )
+    data = {
+        "chat_id": chat_id or TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    if reply_markup is not None:
+        data["reply_markup"] = _json.dumps(reply_markup)
+    resp = requests.post(url, data=data, timeout=30)
     if resp.status_code != 200:
         print(f"Telegram sendMessage failed: {resp.status_code} {resp.text}")
     return resp
