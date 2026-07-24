@@ -1,13 +1,13 @@
-name: Check Instagram Posts
+name: Telegram Command Bot
 
 on:
   schedule:
-    # 02:30 UTC = 07:30 по Астане (UTC+5). Поменяйте минуты/часы под себя.
-    - cron: "30 2 * * *"
-  workflow_dispatch: {}   # позволяет запускать вручную кнопкой в GitHub
+    # Каждые 5 минут — минимальный практический интервал для GitHub Actions
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}
 
 jobs:
-  check-posts:
+  process-commands:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repo
@@ -21,11 +21,10 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run monitor
+      - name: Process Telegram commands
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          PAUSE_BETWEEN_ACCOUNTS: "15"
-        run: python check_posts.py
+        run: python command_bot.py
