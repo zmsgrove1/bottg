@@ -1,0 +1,33 @@
+name: Content Mix Summary
+
+on:
+  schedule:
+    # Каждые 3 дня в 06:00 UTC = 11:00 по Астане.
+    # GitHub cron не умеет "каждые N дней" напрямую — это приближение
+    # через дни месяца, кратные 3 (1,4,7,10,13,16,19,22,25,28,31),
+    # то есть интервал будет чаще всего 3 дня, изредка 2 или 4 дня подряд.
+    - cron: "0 6 1,4,7,10,13,16,19,22,25,28,31 * *"
+  workflow_dispatch: {}
+
+jobs:
+  content-summary:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run content summary
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python content_summary.py
