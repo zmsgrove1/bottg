@@ -73,9 +73,14 @@ def route_telegram_webhook():
 
     update = request.get_json(force=True, silent=True) or {}
     message = update.get("message")
+    callback = update.get("callback_query")
+
     if message and "text" in message:
         chat_id = str(message["chat"]["id"])
         command_bot.process_message(message["text"], chat_id)
+    elif callback:
+        chat_id = str(callback["message"]["chat"]["id"])
+        command_bot.process_callback(callback.get("data", ""), chat_id, callback["id"])
 
     return jsonify({"ok": True})
 
