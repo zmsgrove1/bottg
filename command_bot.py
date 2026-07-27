@@ -14,15 +14,18 @@ not instantly).
 """
 
 import re
+from datetime import datetime, timedelta, timezone
+
 import requests
 
 from common import supabase, TELEGRAM_BOT_TOKEN, send_telegram_text
 
 USERNAME_RE = re.compile(r"^[A-Za-z0-9._]{1,60}$")
+ASTANA_TZ = timezone(timedelta(hours=5))
 
 MAIN_KEYBOARD = {
     "keyboard": [
-        ["📋 Список"],
+        ["📋 Список", "🕒 История"],
         ["➕ Добавить", "➖ Удалить"],
         ["⏸ Пауза", "▶️ Включить"],
     ],
@@ -34,7 +37,18 @@ BUTTON_TO_ACTION = {
     "➖ Удалить": ("remove", "Напишите юзернейм аккаунта для удаления:"),
     "⏸ Пауза": ("pause", "Напишите юзернейм аккаунта для паузы:"),
     "▶️ Включить": ("resume", "Напишите юзернейм аккаунта для включения:"),
+    "🕒 История": ("history", "Напишите юзернейм аккаунта, чтобы посмотреть его последние посты:"),
 }
+
+
+def format_astana(raw: str) -> str:
+    if not raw:
+        return "—"
+    try:
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00")).astimezone(ASTANA_TZ)
+        return dt.strftime("%d.%m.%Y %H:%M")
+    except Exception:
+        return raw
 
 
 def get_offset() -> int:
@@ -111,8 +125,36 @@ def handle_resume(username: str, chat_id: str):
         send_telegram_text(f"@{username} не найден в списке.", chat_id=chat_id, reply_markup=MAIN_KEYBOARD)
 
 
+def handle_history(username: str, chat_id: str):
+    res = (
+        supabase.table("ig_posts")
+        .select("url, post_date, content_type, category")
+        .eq("username", username)
+        .order("post_date", desc=True)
+        .limit(10)
+        .execute()
+    )
+    posts = res.data or []
+    if not posts:
+        send_telegram_text(
+            f"У @{username} пока нет сохранённых постов в истории.",
+            chat_id=chat_id,
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return
+
+    lines = [f"🕒 Последние посты @{username}:\n"]
+    for p in posts:
+        when = format_astana(p.get("post_date"))
+        tag = "🎬" if p.get("content_type") == "reel" else "🖼"
+        lines.append(f"{tag} {when} — {p['url']}")
+    send_telegram_text("\n".join(lines), chat_id=chat_id, reply_markup=MAIN_KEYBOARD)
+
+
 def handle_list(chat_id: str):
-    res = supabase.table("ig_accounts").select("username, active, last_error").execute()
+    res = supabase.table("ig_accounts").select(
+        "username, active, last_error, last_post_date"
+    ).execute()
     accounts = res.data or []
     if not accounts:
         send_telegram_text("Список пуст.", chat_id=chat_id, reply_markup=MAIN_KEYBOARD)
@@ -121,7 +163,8 @@ def handle_list(chat_id: str):
     for a in sorted(accounts, key=lambda x: x["username"]):
         status = "🟢" if a["active"] else "⏸"
         err = " ⚠️" if a.get("last_error") else ""
-        lines.append(f"{status} @{a['username']}{err}")
+        last_post = format_astana(a.get("last_post_date"))
+        lines.append(f"{status} @{a['username']}{err} — послед. пост: {last_post}")
     send_telegram_text("\n".join(lines), chat_id=chat_id, reply_markup=MAIN_KEYBOARD)
 
 
@@ -141,6 +184,7 @@ def process_message(text: str, chat_id: str):
             "remove": handle_remove,
             "pause": handle_pause,
             "resume": handle_resume,
+            "history": handle_history,
         }[pending](username, chat_id)
         return
 
