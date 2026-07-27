@@ -28,8 +28,14 @@ create table if not exists ig_posts (
   caption text,
   post_date timestamptz,
   discovered_at timestamptz not null default now(),
+  content_type text,   -- 'reel' или 'post' — из данных Apify
+  category text,       -- 'campaign' / 'review' / 'general' — приблизительно, по ключевым словам
   unique (username, shortcode)
 );
+
+-- Если таблица ig_posts уже существовала раньше (без этих колонок), выполните:
+-- alter table ig_posts add column if not exists content_type text;
+-- alter table ig_posts add column if not exists category text;
 
 -- Служебная таблица для бота-командера (/add, /remove, /pause) —
 -- хранит смещение (offset) последнего обработанного сообщения Telegram,

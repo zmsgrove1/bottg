@@ -7,26 +7,62 @@ Reports every post published on the FULL PREVIOUS CALENDAR DAY, Astana time
 Sends each such post as a photo + link to Telegram, and logs it into the
 ig_posts history table (used to avoid re-sending a post already reported).
 
+Fetches accounts from Apify CONCURRENTLY (a handful at a time) since each
+call is just a network wait — doing them one-by-one is what made a full
+run of ~38 accounts take 20+ minutes. Sending to Telegram stays sequential
+to avoid flooding the chat all at once.
+
 Designed to run once per day as a scheduled GitHub Actions workflow.
 """
 
 import os
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone, time as dtime
 
 import requests
 
 from common import supabase, send_telegram_text, send_telegram_photo, translate_text
 
-PAUSE_BETWEEN_ACCOUNTS = int(os.environ.get("PAUSE_BETWEEN_ACCOUNTS", "1"))
 RESULTS_PER_ACCOUNT = int(os.environ.get("RESULTS_PER_ACCOUNT", "1"))
+CONCURRENCY = int(os.environ.get("CONCURRENCY", "5"))
 
 APIFY_TOKEN = os.environ["APIFY_TOKEN"]
 APIFY_ACTOR = "apify~instagram-post-scraper"
 APIFY_URL = f"https://api.apify.com/v2/acts/{APIFY_ACTOR}/run-sync-get-dataset-items"
 
 ASTANA_TZ = timezone(timedelta(hours=5))
+
+CAMPAIGN_KEYWORDS = [
+    "kampanya", "indirim", "fırsat", "ücretsiz", "hediye", "promosyon",
+    "kampanya başladı", "deneme seansı", "bayilik", "franchise", "şube açıldı",
+]
+REVIEW_KEYWORDS = [
+    "teşekkür", "yorum", "değerlendirme", "memnuniyet", "önce sonra",
+    "öncesi sonrası", "sonuç", "deneyim", "başarı hikayesi", "danışan",
+]
+
+
+def classify_category(caption: str) -> str:
+    """Rough, keyword-based guess at content category — not exact, just a
+    useful signal since there's no real classifier available."""
+    if not caption:
+        return "general"
+    text = caption.lower()
+    if any(k in text for k in CAMPAIGN_KEYWORDS):
+        return "campaign"
+    if any(k in text for k in REVIEW_KEYWORDS):
+        return "review"
+    return "general"
+
+
+def classify_content_type(item: dict) -> str:
+    """'reel' vs 'post', based on whatever Apify's response tells us."""
+    product_type = (item.get("productType") or "").lower()
+    if product_type == "clips":
+        return "reel"
+    return "post"
 
 
 def get_yesterday_window():
@@ -80,6 +116,8 @@ def log_post(username: str, post: dict):
                 "image_url": post["image_url"],
                 "caption": post["caption"],
                 "post_date": post["date"],
+                "content_type": post.get("content_type", "post"),
+                "category": post.get("category", "general"),
             },
             on_conflict="username,shortcode",
         ).execute()
@@ -104,13 +142,16 @@ def fetch_posts_from_apify(username: str):
         shortcode = item.get("shortCode") or item.get("shortcode")
         if not shortcode:
             continue
+        caption = (item.get("caption") or "").strip()[:300]
         posts.append(
             {
                 "shortcode": shortcode,
                 "url": item.get("url") or f"https://www.instagram.com/p/{shortcode}/",
                 "image_url": item.get("displayUrl") or item.get("thumbnailSrc") or "",
                 "date": item.get("timestamp") or "",
-                "caption": (item.get("caption") or "").strip()[:300],
+                "caption": caption,
+                "content_type": classify_content_type(item),
+                "category": classify_category(caption),
             }
         )
 
@@ -119,13 +160,15 @@ def fetch_posts_from_apify(username: str):
 
 
 def check_account(account: dict, window_start, window_end):
+    """Fetches + evaluates one account. Safe to call from a worker thread —
+    each call only touches rows for its own username."""
     username = account["username"]
     try:
         posts = fetch_posts_from_apify(username)
 
         if not posts:
             mark_checked(username)
-            return []
+            return username, [], None
 
         # Keep last_post_id/date updated to the newest post overall — used
         # by weekly_summary.py to flag accounts that have gone quiet.
@@ -142,13 +185,13 @@ def check_account(account: dict, window_start, window_end):
                 new_posts.append(post)
 
         mark_checked(username)
-        return new_posts
+        return username, new_posts, None
 
     except Exception as e:
         err = f"{type(e).__name__}: {e}"
         print(f"Error checking {username}: {err}")
         mark_checked(username, error=err)
-        return []
+        return username, [], err
 
 
 def main():
@@ -158,21 +201,39 @@ def main():
         return
 
     window_start, window_end = get_yesterday_window()
-    print(f"Checking posts published between {window_start} and {window_end} (Astana time)")
+    print(f"Checking posts published between {window_start} and {window_end} (Astana time), "
+          f"{len(accounts)} accounts, concurrency={CONCURRENCY}")
 
+    start_time = time.monotonic()
+
+    # Phase 1: fetch + evaluate all accounts concurrently (network-bound work).
+    results = {}  # username -> (new_posts, error)
+    with ThreadPoolExecutor(max_workers=CONCURRENCY) as pool:
+        futures = {
+            pool.submit(check_account, account, window_start, window_end): account["username"]
+            for account in accounts
+        }
+        for future in as_completed(futures):
+            username = futures[future]
+            try:
+                uname, new_posts, err = future.result()
+                results[uname] = (new_posts, err)
+            except Exception as e:
+                print(f"Unexpected failure for {username}: {e}")
+                results[username] = ([], f"{type(e).__name__}: {e}")
+
+    elapsed = time.monotonic() - start_time
+    print(f"Fetch phase done in {elapsed:.1f}s")
+
+    # Phase 2: send results to Telegram sequentially, in the original order.
     total_new = 0
     failed = []
-    skipped_out_of_time = []
-    start_time = time.monotonic()
-    MAX_TOTAL_SECONDS = 20 * 60  # safety cap: never let the whole run exceed ~20 min
 
-    for idx, account in enumerate(accounts):
-        if time.monotonic() - start_time > MAX_TOTAL_SECONDS:
-            skipped_out_of_time.extend(a["username"] for a in accounts[idx:])
-            break
-
+    for account in accounts:
         username = account["username"]
-        new_posts = check_account(account, window_start, window_end)
+        new_posts, err = results.get(username, ([], None))
+        if err:
+            failed.append(username)
 
         for post in new_posts:
             log_post(username, post)
@@ -180,10 +241,7 @@ def main():
             if post["caption"]:
                 original = post["caption"][:150]
                 translated = translate_text(original)
-                if translated:
-                    caption_snippet = f"\n{translated}"
-                else:
-                    caption_snippet = f"\n{original}"
+                caption_snippet = f"\n{translated}" if translated else f"\n{original}"
             text = f"\U0001F4F8 @{username}\n{post['url']}{caption_snippet}"
             if post["image_url"]:
                 resp = send_telegram_photo(post["image_url"], text)
@@ -194,27 +252,12 @@ def main():
             total_new += 1
             time.sleep(1)
 
-        refreshed = supabase.table("ig_accounts").select("last_error").eq(
-            "username", username
-        ).single().execute()
-        if refreshed.data and refreshed.data.get("last_error"):
-            failed.append(username)
-
-        if idx < len(accounts) - 1:
-            time.sleep(PAUSE_BETWEEN_ACCOUNTS)
-
     if total_new == 0:
         send_telegram_text(f"Постов за {window_start.date()} нет ни у одного аккаунта.")
 
     if failed:
         send_telegram_text(
             "\u26A0\uFE0F Не удалось проверить: " + ", ".join(f"@{u}" for u in failed)
-        )
-
-    if skipped_out_of_time:
-        send_telegram_text(
-            "\u23F1 Прогон превысил лимит времени, не успели проверить: "
-            + ", ".join(f"@{u}" for u in skipped_out_of_time)
         )
 
 
