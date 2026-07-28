@@ -1,5 +1,7 @@
-"""Shared helpers used by check_posts.py, weekly_summary.py, and command_bot.py."""
+"""Shared helpers used by check_posts.py, weekly_summary.py, command_bot.py,
+content_summary.py, and design_bot.py."""
 
+import json as _json
 import os
 import requests
 from supabase import create_client
@@ -9,12 +11,16 @@ SUPABASE_KEY = os.environ["SUPABASE_KEY"]
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
+# Optional second bot (e.g. a separate "content idea" bot posting to the
+# same group) — falls back to the main bot's token if not configured.
+TELEGRAM_BOT_TOKEN_2 = os.environ.get("TELEGRAM_BOT_TOKEN_2", TELEGRAM_BOT_TOKEN)
+
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 
-def send_telegram_text(text: str, chat_id: str = None, reply_markup: dict = None):
-    import json as _json
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+def send_telegram_text(text: str, chat_id: str = None, reply_markup: dict = None, bot_token: str = None):
+    token = bot_token or TELEGRAM_BOT_TOKEN
+    url = f"https://api.telegram.org/bot{token}/sendMessage"
     data = {
         "chat_id": chat_id or TELEGRAM_CHAT_ID,
         "text": text,
@@ -29,8 +35,9 @@ def send_telegram_text(text: str, chat_id: str = None, reply_markup: dict = None
     return resp
 
 
-def send_telegram_photo(photo_url: str, caption: str, chat_id: str = None):
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+def send_telegram_photo(photo_url: str, caption: str, chat_id: str = None, bot_token: str = None):
+    token = bot_token or TELEGRAM_BOT_TOKEN
+    url = f"https://api.telegram.org/bot{token}/sendPhoto"
     resp = requests.post(
         url,
         data={
@@ -71,7 +78,6 @@ def translate_text(text: str, source: str = "tr", target: str = "ru") -> str:
             return ""
         data = resp.json()
         translated = data.get("responseData", {}).get("translatedText", "")
-        # MyMemory sometimes returns an error string as "translated" text
         if "MYMEMORY WARNING" in translated.upper():
             print(f"Translation quota/warning: {translated}")
             return ""
@@ -85,21 +91,20 @@ OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.4-mini")
 
 
-def ask_gpt(question: str) -> str:
-    """Calls the OpenAI chat completions API. Returns a user-facing error
-    string (not an exception) on failure, since this is only ever called
-    to build a Telegram reply."""
+def ask_gpt(question: str, system: str = None, max_tokens: int = 800) -> str:
+    """Calls the OpenAI chat completions API (text-only). Returns a
+    user-facing error string (not an exception) on failure."""
     if not OPENAI_API_KEY:
         return "GPT не настроен — не хватает OPENAI_API_KEY."
+    messages = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": question})
     try:
         resp = requests.post(
             "https://api.openai.com/v1/chat/completions",
             headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
-            json={
-                "model": OPENAI_MODEL,
-                "messages": [{"role": "user", "content": question}],
-                "max_tokens": 800,
-            },
+            json={"model": OPENAI_MODEL, "messages": messages, "max_tokens": max_tokens},
             timeout=60,
         )
         if resp.status_code != 200:
@@ -110,3 +115,101 @@ def ask_gpt(question: str) -> str:
     except Exception as e:
         print(f"OpenAI call failed: {e}")
         return f"Не получилось получить ответ от GPT: {e}"
+
+
+def ask_gpt_vision(image_url: str, instructions: str, max_tokens: int = 1500) -> str:
+    """Sends a reference image + instructions to a vision-capable OpenAI
+    model and returns the text response. PAID (OpenAI) — kept here for
+    later, once the free pipeline below is proven out."""
+    if not OPENAI_API_KEY:
+        return "GPT не настроен — не хватает OPENAI_API_KEY."
+    try:
+        resp = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+            json={
+                "model": OPENAI_MODEL,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": instructions},
+                            {"type": "image_url", "image_url": {"url": image_url}},
+                        ],
+                    }
+                ],
+                "max_tokens": max_tokens,
+            },
+            timeout=90,
+        )
+        if resp.status_code != 200:
+            print(f"OpenAI vision API error: {resp.status_code} {resp.text}")
+            return f"Ошибка GPT vision API: {resp.status_code}"
+        data = resp.json()
+        return data["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        print(f"OpenAI vision call failed: {e}")
+        return f"Не получилось проанализировать картинку: {e}"
+
+
+# ---------------------------------------------------------------------------
+# FREE alternative via Pollinations (no API key). This is what design_bot.py
+# uses right now, since the plan is: build the free version first, switch
+# specific steps to the paid OpenAI functions above later if quality needs it.
+
+POLLINATIONS_TEXT_URL = "https://text.pollinations.ai/openai"
+
+
+def ask_pollinations_text(prompt: str, system: str = None, model: str = "openai", max_tokens: int = 800) -> str:
+    """Free text generation via Pollinations (OpenAI-compatible endpoint,
+    no key needed). Returns '' on failure so callers can fall back cleanly."""
+    messages = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": prompt})
+    try:
+        resp = requests.post(
+            POLLINATIONS_TEXT_URL,
+            json={"model": model, "messages": messages, "max_tokens": max_tokens},
+            timeout=60,
+        )
+        if resp.status_code != 200:
+            print(f"Pollinations text error: {resp.status_code} {resp.text}")
+            return ""
+        data = resp.json()
+        return data["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        print(f"Pollinations text call failed: {e}")
+        return ""
+
+
+def ask_pollinations_vision(image_url: str, instructions: str, model: str = "openai-large", max_tokens: int = 1500) -> str:
+    """Free vision (image analysis) via Pollinations — same endpoint as
+    ask_pollinations_text, just with an image_url content part added.
+    'openai-large' is Pollinations' more capable vision model."""
+    try:
+        resp = requests.post(
+            POLLINATIONS_TEXT_URL,
+            json={
+                "model": model,
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": instructions},
+                            {"type": "image_url", "image_url": {"url": image_url}},
+                        ],
+                    }
+                ],
+                "max_tokens": max_tokens,
+            },
+            timeout=90,
+        )
+        if resp.status_code != 200:
+            print(f"Pollinations vision error: {resp.status_code} {resp.text}")
+            return ""
+        data = resp.json()
+        return data["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        print(f"Pollinations vision call failed: {e}")
+        return ""

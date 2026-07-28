@@ -9,6 +9,7 @@ Endpoints:
   GET/POST /check-posts?token=...        — run the daily Instagram check
   GET/POST /weekly-summary?token=...      — run the weekly stale-account summary
   GET/POST /content-summary?token=...     — run the content-mix summary
+  GET/POST /design-draft?token=...        — run the content-idea/design-draft bot
   POST     /telegram-webhook              — Telegram sends updates here instantly
   GET      /                              — health check (also what wakes the
                                              service up from sleep on free tier)
@@ -21,6 +22,7 @@ import check_posts
 import weekly_summary
 import content_summary
 import command_bot
+import design_bot
 
 app = Flask(__name__)
 
@@ -59,6 +61,13 @@ def route_weekly_summary():
 def route_content_summary():
     require_cron_secret()
     content_summary.main()
+    return jsonify({"status": "ok"})
+
+
+@app.route("/design-draft", methods=["GET", "POST"])
+def route_design_draft():
+    require_cron_secret()
+    design_bot.main()
     return jsonify({"status": "ok"})
 
 

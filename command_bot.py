@@ -31,6 +31,7 @@ from common import supabase, TELEGRAM_BOT_TOKEN, send_telegram_text, ask_gpt
 import check_posts
 import weekly_summary
 import content_summary
+import design_bot
 
 USERNAME_RE = re.compile(r"^[A-Za-z0-9._]{1,60}$")
 ASTANA_TZ = timezone(timedelta(hours=5))
@@ -67,6 +68,7 @@ RUN_ACTIONS = {
     "check_posts": ("📸 Проверка постов за вчера", check_posts.main),
     "weekly_summary": ("📅 Сводка молчунов", weekly_summary.main),
     "content_summary": ("📊 Сводка по контенту", content_summary.main),
+    "design_draft": ("💡 Идеи по мотивам утренних постов", design_bot.main),
 }
 
 
