@@ -27,7 +27,7 @@ from datetime import datetime, timedelta, timezone
 
 import requests
 
-from common import supabase, TELEGRAM_BOT_TOKEN, send_telegram_text
+from common import supabase, TELEGRAM_BOT_TOKEN, send_telegram_text, ask_gpt
 import check_posts
 import weekly_summary
 import content_summary
@@ -39,7 +39,7 @@ MAIN_KEYBOARD = {
     "keyboard": [
         ["📋 Список", "🕒 История"],
         ["📊 По категориям"],
-        ["▶️ Запустить проверку"],
+        ["▶️ Запустить проверку", "💬 Спросить GPT"],
         ["⏸ Пауза всем", "▶️ Включить всех"],
         ["➕ Добавить", "➖ Удалить"],
         ["⏸ Пауза", "▶️ Включить"],
@@ -52,6 +52,7 @@ BUTTON_TO_ACTION = {
     "➖ Удалить": ("remove", "Напишите юзернейм аккаунта для удаления:"),
     "⏸ Пауза": ("pause", "Напишите юзернейм аккаунта для паузы:"),
     "▶️ Включить": ("resume", "Напишите юзернейм аккаунта для включения:"),
+    "💬 Спросить GPT": ("ask_gpt", "Задайте вопрос для GPT:"),
 }
 
 CATEGORY_LABELS = {
@@ -356,8 +357,12 @@ def process_message(text: str, chat_id: str):
 
     pending = get_pending(chat_id)
     if pending:
-        username = clean_username(text)
         clear_pending(chat_id)
+        if pending == "ask_gpt":
+            answer = ask_gpt(text)
+            send_telegram_text(f"💬 GPT:\n{answer}", chat_id=chat_id, reply_markup=MAIN_KEYBOARD)
+            return
+        username = clean_username(text)
         {
             "add": handle_add,
             "remove": handle_remove,

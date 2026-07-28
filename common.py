@@ -79,3 +79,34 @@ def translate_text(text: str, source: str = "tr", target: str = "ru") -> str:
     except Exception as e:
         print(f"Translation error: {e}")
         return ""
+
+
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "gpt-5.4-mini")
+
+
+def ask_gpt(question: str) -> str:
+    """Calls the OpenAI chat completions API. Returns a user-facing error
+    string (not an exception) on failure, since this is only ever called
+    to build a Telegram reply."""
+    if not OPENAI_API_KEY:
+        return "GPT не настроен — не хватает OPENAI_API_KEY."
+    try:
+        resp = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+            json={
+                "model": OPENAI_MODEL,
+                "messages": [{"role": "user", "content": question}],
+                "max_tokens": 800,
+            },
+            timeout=60,
+        )
+        if resp.status_code != 200:
+            print(f"OpenAI API error: {resp.status_code} {resp.text}")
+            return f"Ошибка GPT API: {resp.status_code}"
+        data = resp.json()
+        return data["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        print(f"OpenAI call failed: {e}")
+        return f"Не получилось получить ответ от GPT: {e}"
